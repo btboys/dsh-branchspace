@@ -64,6 +64,11 @@ export class BranchRegistry {
     return Object.values(this.data.repos[repoPath] ?? {})
   }
 
+  /** All repository paths currently tracked by the registry. */
+  repos(): string[] {
+    return Object.keys(this.data.repos)
+  }
+
   async get(repoPath: string, branch: string): Promise<BranchRecord | undefined> {
     return this.data.repos[repoPath]?.[branch]
   }

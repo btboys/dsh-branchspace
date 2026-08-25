@@ -56,6 +56,8 @@ export interface BranchView {
   workspaceId?: string
   sessionCount: number
   sessionIds: string[]
+  /** Live (in-memory) sessions mounted on this branch's workspace. */
+  liveCount: number
   dirty: boolean
   createdAt: string
 }
@@ -164,6 +166,7 @@ export class Branchspace {
         workspaceId: rec.workspaceId,
         sessionCount: rec.sessionIds.length,
         sessionIds: [...rec.sessionIds],
+        liveCount: rec.workspaceId ? (await this.deps.sessions.liveSessionIds(rec.workspaceId)).length : 0,
         dirty: await isWorktreeDirty(rec.worktreePath).catch(() => false),
         createdAt: rec.createdAt,
       })),
@@ -214,5 +217,19 @@ export class Branchspace {
   /** Default base branch of a repo (used by UI hints). */
   async defaultBase(repoPath: string): Promise<string> {
     return defaultBranch(await resolveMainRepoRoot(repoPath))
+  }
+
+  /** Every tracked repository with its branch views — the UI panel's data shape. */
+  async overview(): Promise<{ repoPath: string; repoName: string; branches: BranchView[] }[]> {
+    await this.deps.registry.reconcile()
+    const out: { repoPath: string; repoName: string; branches: BranchView[] }[] = []
+    for (const repoPath of this.deps.registry.repos()) {
+      try {
+        out.push({ repoPath, repoName: this.repoName(repoPath), branches: await this.list({ repoPath }) })
+      } catch {
+        // repo unreadable right now; reconcile already dropped its records
+      }
+    }
+    return out
   }
 }
