@@ -13,7 +13,6 @@ import { registerCommands } from './commands.js'
 import { BranchRegistry, defaultRegistryPath } from './registry.js'
 import { DshSessionFactory } from './factory.js'
 import { registerRpc } from './rpc.js'
-import { registerTools } from './tools.js'
 import type {
   AgentDefaultModelLike,
   AgentRegistryLike,
@@ -62,9 +61,15 @@ export function apply(ctx: Context, config?: BranchspacePluginConfig): void {
   const dispose: (() => void)[] = []
   dispose.push(registerCommands(host.commands, branchspace))
 
-  // optional halves: register as soon as their services become available
+  // optional halves: register as soon as their services become available.
+  // tools.js is imported lazily: it statically imports @deepseek-ai/dsh-tools,
+  // which must not crash profiles (or tests) where that package is absent.
   ctx.inject(['tools'], (injected) => {
-    dispose.push(registerTools((injected as unknown as { tools: ToolRuntimeLike }).tools, branchspace))
+    let dispose: (() => void) | undefined
+    void import('./tools.js').then((m) => {
+      dispose = m.registerTools((injected as unknown as { tools: ToolRuntimeLike }).tools, branchspace)
+    })
+    return () => dispose?.()
   })
   ctx.inject(['connection'], (injected) => {
     let disposeRpc: (() => Promise<void>) | undefined
