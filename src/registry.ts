@@ -1,4 +1,4 @@
-import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { BranchspaceError, listWorktrees, resolveMainRepoRoot } from './git.js'
@@ -33,10 +33,13 @@ export function defaultRegistryPath(): string {
 export class BranchRegistry {
   private data: RegistryFile = { version: 1, repos: {} }
   private writeQueue: Promise<void> = Promise.resolve()
+  private loaded = false
 
   constructor(readonly filePath: string = defaultRegistryPath()) {}
 
+  /** Idempotent: repeat calls are no-ops, so service methods can always await it first. */
   async load(): Promise<void> {
+    if (this.loaded) return
     try {
       const raw = await readFile(this.filePath, 'utf8')
       const parsed = JSON.parse(raw) as RegistryFile
@@ -47,11 +50,12 @@ export class BranchRegistry {
       // missing or corrupted file: start empty (corrupted file gets overwritten on next write)
       this.data = { version: 1, repos: {} }
     }
+    this.loaded = true
   }
 
   private async save(): Promise<void> {
-    // serialize writes to avoid interleaved partial JSON
-    this.writeQueue = this.writeQueue.then(async () => {
+    // serialize writes; a failed write must not poison the queue forever
+    this.writeQueue = this.writeQueue.catch(() => {}).then(async () => {
       await mkdir(dirname(this.filePath), { recursive: true })
       const tmp = `${this.filePath}.tmp-${process.pid}`
       await writeFile(tmp, JSON.stringify(this.data, null, 2))
@@ -112,10 +116,22 @@ export class BranchRegistry {
    * Drop records whose worktree disappeared from `git worktree list`,
    * and records for repositories that no longer exist on disk.
    * Returns the dropped records (for logging / UI notification).
+   *
+   * Failure policy: a repo whose directory is gone (ENOENT) loses all its
+   * records, but a repo that exists yet fails git interrogation (transient
+   * I/O, corrupt .git, network mount hiccup) is LEFT UNTOUCHED — reconcile
+   * must never destroy bookkeeping on a maybe-temporary error.
    */
   async reconcile(): Promise<BranchRecord[]> {
     const dropped: BranchRecord[] = []
     for (const [repoPath, branches] of Object.entries(this.data.repos)) {
+      const dir = await stat(repoPath).catch(() => null)
+      if (!dir?.isDirectory()) {
+        // repo directory really gone: drop everything
+        dropped.push(...Object.values(branches))
+        delete this.data.repos[repoPath]
+        continue
+      }
       let livePaths: Set<string> | null = null
       try {
         const root = await resolveMainRepoRoot(repoPath)
@@ -124,10 +140,10 @@ export class BranchRegistry {
         const worktrees = await listWorktrees(root)
         livePaths = new Set(await Promise.all(worktrees.map((w) => canonical(w.path))))
       } catch {
-        livePaths = null // repo gone or unreadable
+        continue // transient failure: keep this repo's records as-is
       }
       for (const [branch, rec] of Object.entries(branches)) {
-        if (livePaths === null || !livePaths.has(await canonical(rec.worktreePath))) {
+        if (!livePaths.has(await canonical(rec.worktreePath))) {
           dropped.push(rec)
           delete branches[branch]
         }

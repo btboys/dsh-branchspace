@@ -102,3 +102,16 @@ test('a corrupted registry file is treated as empty instead of crashing', async 
   await reg.upsert(repo, { branch: 'b1', worktreePath: '/x', sessionIds: [], createdAt: 'now' })
   assert.equal((await reg.list(repo)).length, 1)
 })
+
+test('reconcile keeps records when the repo exists but git is transiently broken', async (t) => {
+  const file = await makeRegistryFile(t)
+  const repo = await makeTempRepo(t)
+  const reg = new BranchRegistry(file)
+  await reg.load()
+  await reg.upsert(repo, { branch: 'b1', worktreePath: join(repo, '.branchspace', 'b1'), sessionIds: [], createdAt: 'now' })
+  // break git for this repo: corrupt .git/HEAD
+  await writeFile(join(repo, '.git', 'HEAD'), 'garbage-not-a-ref\n')
+  const dropped = await reg.reconcile()
+  assert.deepEqual(dropped, [], 'transient git failure must not drop records')
+  assert.equal((await reg.list(repo)).length, 1)
+})

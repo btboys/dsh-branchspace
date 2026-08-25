@@ -102,10 +102,8 @@ test('start → list → finish through the command handler over a real repo', a
   assert.equal(refused.kind, 'error')
   assert.match(refused.text, /live session/)
 
-  // session closed → finish succeeds, workspace record removed, branch kept
-  // (the mock removes the live session; the caller session stays)
-  const { liveSessions } = { liveSessions: null }
-  // emulate closing: delete from the live map via finish --force instead
+  // session closed → finish succeeds, workspace record removed, branch kept;
+  // here we force-finish, which must report the live session as orphaned
   const forced = await handler(invocation('finish feature-a --force'))
   assert.equal(forced.kind, 'success')
   assert.match(forced.text, /orphaned sessions/)

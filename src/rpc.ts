@@ -10,8 +10,11 @@ function ok<T>(value: T): RpcResultLike<T> {
 
 function fail(err: unknown): RpcResultLike<never> {
   const message = err instanceof Error ? err.message : String(err)
-  const code = err instanceof BranchspaceError ? 'bad-request' : 'internal'
-  return { ok: false, error: { code, message, details: {} } }
+  // the wire schema is a closed union: bad-request requires `issues`, internal takes {}
+  if (err instanceof BranchspaceError) {
+    return { ok: false, error: { code: 'bad-request', message, details: { issues: [] } } }
+  }
+  return { ok: false, error: { code: 'internal', message, details: {} } }
 }
 
 function str(payload: Record<string, unknown>, key: string): string {

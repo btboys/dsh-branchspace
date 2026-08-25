@@ -298,3 +298,15 @@ test('overview drops repos whose worktrees vanished while offline', async (t) =>
   await removeWorktree(await resolveMainRepoRoot(repo), started.worktreePath, true)
   assert.deepEqual(await bs.overview(), [])
 })
+
+test('finish tolerates a worktree removed out-of-band and still cleans the record', async (t) => {
+  const { bs, repo, sessions } = await setup(t)
+  const started = await bs.start({ repoPath: repo, branch: 'feature-a' })
+  sessions.workspaces.get(started.workspaceId).sessionIds.length = 0 // sessions closed
+  const { removeWorktree, resolveMainRepoRoot } = await import('../lib/git.js')
+  await removeWorktree(await resolveMainRepoRoot(repo), started.worktreePath, true)
+  const result = await bs.finish({ repoPath: repo, branch: 'feature-a' })
+  assert.equal(result.branch, 'feature-a')
+  assert.equal(sessions.workspaces.size, 0)
+  assert.deepEqual(await bs.list({ repoPath: repo }), [])
+})

@@ -46,37 +46,41 @@ export function apply(ctx: Context, config?: BranchspacePluginConfig): void {
   const registry = new BranchRegistry(config?.registryPath ?? defaultRegistryPath())
   const branchspace = new Branchspace({ registry, sessions: new DshSessionFactory(host) })
 
+  // startup reconcile: drop records whose worktrees vanished while dsh was down
   const ready = (async () => {
     await registry.load()
     const dropped = await branchspace.reconcile()
     if (dropped.length > 0) {
-      ctx.logger?.warn(
-        `branchspace: dropped ${dropped.length} stale record(s) whose worktrees vanished: ${dropped
+      ctx.logger('branchspace').warn(
+        `dropped ${dropped.length} stale record(s) whose worktrees vanished: ${dropped
           .map((r) => r.branch)
           .join(', ')}`,
       )
     }
   })()
+  ready.catch((err) => ctx.logger('branchspace').warn('startup reconcile failed: %s', String(err)))
 
-  const dispose: (() => void)[] = []
-  dispose.push(registerCommands(host.commands, branchspace))
+  // registrations are fiber-owned: unload/HMR retracts commands, tools, RPC
+  ctx.effect(function* () {
+    yield registerCommands(host.commands, branchspace)
 
-  // optional halves: register as soon as their services become available.
-  // tools.js is imported lazily: it statically imports @deepseek-ai/dsh-tools,
-  // which must not crash profiles (or tests) where that package is absent.
-  ctx.inject(['tools'], (injected) => {
-    let dispose: (() => void) | undefined
-    void import('./tools.js').then((m) => {
-      dispose = m.registerTools((injected as unknown as { tools: ToolRuntimeLike }).tools, branchspace)
+    // optional halves: register as soon as their services become available.
+    // tools.js is imported lazily: it statically imports @deepseek-ai/dsh-tools,
+    // which must not crash profiles (or tests) where that package is absent.
+    ctx.inject(['tools'], (injected) => {
+      let dispose: (() => void) | undefined
+      void import('./tools.js').then((m) => {
+        dispose = m.registerTools((injected as unknown as { tools: ToolRuntimeLike }).tools, branchspace)
+      })
+      return () => dispose?.()
     })
-    return () => dispose?.()
-  })
-  ctx.inject(['connection'], (injected) => {
-    let disposeRpc: (() => Promise<void>) | undefined
-    void ready.then(async () => {
-      disposeRpc = await registerRpc((injected as unknown as { connection: HostConnectionLike }).connection, branchspace)
+    ctx.inject(['connection'], (injected) => {
+      let disposeRpc: (() => Promise<void>) | undefined
+      void ready.then(async () => {
+        disposeRpc = await registerRpc((injected as unknown as { connection: HostConnectionLike }).connection, branchspace)
+      })
+      return () => void disposeRpc?.()
     })
-    return () => void disposeRpc?.()
   })
 }
 

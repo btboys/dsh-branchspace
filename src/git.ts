@@ -48,7 +48,7 @@ export async function resolveMainRepoRoot(repoPath: string): Promise<string> {
   return root
 }
 
-const INVALID_REF_CHARS = /[\x00-\x20 ~^:?*[\\]/
+const INVALID_REF_CHARS = /[\x00-\x20\x7f ~^:?*[\\]/
 
 /**
  * Validate a branch name against git ref rules (mirrors `git check-ref-format --branch`).

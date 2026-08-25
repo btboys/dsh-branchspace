@@ -7,6 +7,7 @@ import {
   deleteBranch,
   ensureBranchspaceExcluded,
   isWorktreeDirty,
+  listWorktrees,
   removeWorktree,
   resolveMainRepoRoot,
   validateBranchName,
@@ -117,6 +118,7 @@ export class Branchspace {
   }
 
   async start(input: StartInput): Promise<StartResult> {
+    await this.deps.registry.load()
     const invalid = validateBranchName(input.branch)
     if (invalid) {
       throw new BranchspaceError(`invalid branch name ${JSON.stringify(input.branch)}: ${invalid}`, 'INVALID_BRANCH')
@@ -156,6 +158,7 @@ export class Branchspace {
   }
 
   async list(input: ListInput): Promise<BranchView[]> {
+    await this.deps.registry.load()
     const root = await resolveMainRepoRoot(input.repoPath)
     await this.deps.registry.reconcile()
     const records = await this.deps.registry.list(root)
@@ -174,6 +177,7 @@ export class Branchspace {
   }
 
   async finish(input: FinishInput): Promise<FinishResult> {
+    await this.deps.registry.load()
     const root = await resolveMainRepoRoot(input.repoPath)
     return this.mutex.run(this.lockKey(root, input.branch), async () => {
       const rec = await this.deps.registry.get(root, input.branch)
@@ -188,13 +192,19 @@ export class Branchspace {
           'LIVE_SESSIONS',
         )
       }
-      if (!input.force && (await isWorktreeDirty(worktreePath).catch(() => false))) {
+      // the worktree may have been removed out-of-band; only then skip git removal
+      const stillRegistered = (await listWorktrees(root)).some(
+        (w) => w.path === worktreePath || w.branch === input.branch,
+      )
+      if (stillRegistered && !input.force && (await isWorktreeDirty(worktreePath))) {
         throw new BranchspaceError(
           `worktree for branch "${input.branch}" is dirty; commit/stash changes or pass force`,
           'DIRTY_WORKTREE',
         )
       }
-      await removeWorktree(root, worktreePath, Boolean(input.force))
+      if (stillRegistered) {
+        await removeWorktree(root, worktreePath, Boolean(input.force))
+      }
       let deletedBranch = false
       if (input.deleteBranch) {
         await deleteBranch(root, input.branch)
@@ -221,6 +231,7 @@ export class Branchspace {
 
   /** Every tracked repository with its branch views — the UI panel's data shape. */
   async overview(): Promise<{ repoPath: string; repoName: string; branches: BranchView[] }[]> {
+    await this.deps.registry.load()
     await this.deps.registry.reconcile()
     const out: { repoPath: string; repoName: string; branches: BranchView[] }[] = []
     for (const repoPath of this.deps.registry.repos()) {

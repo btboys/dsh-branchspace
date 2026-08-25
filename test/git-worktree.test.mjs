@@ -112,3 +112,21 @@ test('resolveMainRepoRoot is not fooled by the branchspace worktree it created',
   const wtPath = await addWorktree(repo, 'feature-a')
   await assert.rejects(() => resolveMainRepoRoot(wtPath), /worktree/i)
 })
+
+test('addWorktree reuse check is canonical: a worktree registered via a symlink spelling is reused', async (t) => {
+  const repo = await makeTempRepo(t)
+  const { symlink, mkdtemp, realpath } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const linkBase = await realpath(await mkdtemp(join(tmpdir(), 'branchspace-canon-')))
+  t.after(() => import('node:fs/promises').then((fs) => fs.rm(linkBase, { recursive: true, force: true })))
+  const link = join(linkBase, 'repo-link')
+  await symlink(repo, link)
+  // register the worktree through the NON-canonical symlinked spelling
+  const literalViaLink = join(link, '.branchspace', worktreeDirName('feature-a'))
+  await git(['worktree', 'add', literalViaLink, '-b', 'feature-a'], repo)
+  // addWorktree through the canonical root must reuse, not fail with "already exists"
+  const wtPath = await addWorktree(repo, 'feature-a')
+  assert.equal(wtPath, join(repo, '.branchspace', worktreeDirName('feature-a')))
+  const list = await listWorktrees(repo)
+  assert.equal(list.filter((w) => w.branch === 'feature-a').length, 1)
+})
