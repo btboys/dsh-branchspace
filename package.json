@@ -1,0 +1,48 @@
+{
+  "name": "dsh-branchspace",
+  "version": "0.1.0",
+  "description": "Git branch workspaces for DeepSeek Harness: one branch = one git worktree + one dsh workspace + isolated sessions",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/client/index.d.ts",
+      "default": "./lib/client/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf lib",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:watch": "node --test --watch test/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "git",
+    "worktree",
+    "branch",
+    "workspace"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}
