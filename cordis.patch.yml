@@ -1,0 +1,22 @@
+# dsh-branchspace bundle patch
+#
+# Installing through the official CLI —
+#
+#   dsh plugin --profile web add dsh-branchspace
+#
+# — reconciles `dsh.profile.bundles` against installed packages and, seeing the
+# `dsh.bundle.patch` declaration in package.json, appends `dsh-branchspace` to
+# the bundle stack. Profile boot then merges THIS patch (a single `insert` of
+# the plugin row). No profile file edits needed.
+#
+# Optional config:
+#
+#   - insert:
+#       - id: branchspace
+#         name: 'dsh-branchspace'
+#         config:
+#           registryPath: /custom/path/branchspace.json   # default: ~/.dsh/branchspace.json
+#
+- insert:
+    - id: branchspace
+      name: 'dsh-branchspace'
