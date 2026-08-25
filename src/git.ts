@@ -111,15 +111,26 @@ export async function branchExists(repoRoot: string, branch: string): Promise<bo
  * Create (or reuse) the worktree for `branch` under `<repoRoot>/.branchspace/`.
  * Uses `-b <branch> <baseBranch>` for new branches; existing branches are reused
  * without `-b`. Idempotent: if the worktree is already registered, returns its path.
+ *
+ * The returned path is canonical (`fs.realpath`): every downstream consumer —
+ * session cwd, workspace registration, registry persistence — must never see
+ * the joined literal, because symlinked prefixes (/tmp, $HOME) would otherwise
+ * break dsh's `realpath`-based cwd validation.
+ *
+ * Rollback safety: a `git worktree list` snapshot is taken before `add`; on
+ * failure the target worktree is removed only when it was absent from that
+ * snapshot (i.e. provably created by this call). Anything pre-existing is
+ * never touched.
  */
 export async function addWorktree(repoRoot: string, branch: string, baseBranch?: string): Promise<string> {
   const invalid = validateBranchName(branch)
   if (invalid) throw new BranchspaceError(`invalid branch name ${JSON.stringify(branch)}: ${invalid}`, 'INVALID_BRANCH')
-  const wtPath = worktreePathFor(repoRoot, branch)
-  const existing = await listWorktrees(repoRoot)
-  const found = existing.find((w) => w.path === wtPath)
-  if (found) return wtPath
-  const args = ['worktree', 'add', wtPath]
+  const snapshot = await listWorktrees(repoRoot)
+  const snapshotPaths = new Set(snapshot.map((w) => w.path))
+  const literal = worktreePathFor(repoRoot, branch)
+  const found = snapshot.find((w) => w.path === literal)
+  if (found) return realpath(found.path)
+  const args = ['worktree', 'add', literal]
   if (await branchExists(repoRoot, branch)) {
     args.push(branch)
   } else {
@@ -128,11 +139,15 @@ export async function addWorktree(repoRoot: string, branch: string, baseBranch?:
   try {
     await runGit(args, repoRoot)
   } catch (err) {
-    // rollback: never leave a half-created worktree behind
-    await runGit(['worktree', 'remove', '--force', wtPath], repoRoot).catch(() => {})
+    // rollback only what THIS call created
+    const now = await listWorktrees(repoRoot).catch(() => [] as WorktreeInfo[])
+    const created = now.find((w) => w.path === literal)
+    if (created && !snapshotPaths.has(created.path)) {
+      await runGit(['worktree', 'remove', '--force', literal], repoRoot).catch(() => {})
+    }
     throw err
   }
-  return wtPath
+  return realpath(literal)
 }
 
 /** Parse `git worktree list --porcelain` into structured records. */

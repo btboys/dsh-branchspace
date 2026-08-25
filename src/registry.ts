@@ -1,7 +1,12 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { BranchspaceError, listWorktrees, resolveMainRepoRoot } from './git.js'
+
+/** Canonicalize a path for comparison; missing paths compare as themselves. */
+async function canonical(path: string): Promise<string> {
+  return realpath(path).catch(() => path)
+}
 
 export interface BranchRecord {
   branch: string
@@ -109,12 +114,15 @@ export class BranchRegistry {
       let livePaths: Set<string> | null = null
       try {
         const root = await resolveMainRepoRoot(repoPath)
-        livePaths = new Set((await listWorktrees(root)).map((w) => w.path))
+        // both sides canonical before comparing: git may report non-realpath
+        // spellings for worktrees registered through symlinked parents
+        const worktrees = await listWorktrees(root)
+        livePaths = new Set(await Promise.all(worktrees.map((w) => canonical(w.path))))
       } catch {
         livePaths = null // repo gone or unreadable
       }
       for (const [branch, rec] of Object.entries(branches)) {
-        if (livePaths === null || !livePaths.has(rec.worktreePath)) {
+        if (livePaths === null || !livePaths.has(await canonical(rec.worktreePath))) {
           dropped.push(rec)
           delete branches[branch]
         }

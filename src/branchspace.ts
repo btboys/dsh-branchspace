@@ -20,6 +20,8 @@ export interface SessionFactory {
   ensureWorkspace(input: { path: string; title: string }): Promise<string>
   /** Create a dsh session attached to the workspace; cwd must equal the workspace path. */
   createSession(input: { workspaceId: string; cwd: string; title?: string }): Promise<string>
+  /** Live (in-memory, running) sessions currently mounted on the workspace. */
+  liveSessionIds(workspaceId: string): Promise<string[]>
   /** Remove the workspace record (session logs are never deleted). */
   removeWorkspace?(workspaceId: string): Promise<void>
 }
@@ -69,14 +71,42 @@ export interface FinishResult {
   branch: string
   worktreePath: string
   removedWorkspaceId?: string
+  /** Live sessions whose cwd vanished because finish was forced. Empty otherwise. */
+  orphanedSessionIds: string[]
   deletedBranch: boolean
 }
 
+/** In-process keyed mutex: serializes start/finish per (canonicalRepoPath, branch). */
+class KeyedMutex {
+  private tails = new Map<string, Promise<void>>()
+
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const tail = this.tails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const next = tail.then(() => gate)
+    this.tails.set(key, next)
+    await tail
+    try {
+      return await fn()
+    } finally {
+      release()
+      if (this.tails.get(key) === next) this.tails.delete(key)
+    }
+  }
+}
+
 export class Branchspace {
+  private readonly mutex = new KeyedMutex()
+
   constructor(private readonly deps: BranchspaceDeps) {}
 
   private repoName(root: string): string {
     return this.deps.repoName?.(root) ?? basename(root)
+  }
+
+  private lockKey(root: string, branch: string): string {
+    return JSON.stringify([root, branch])
   }
 
   /** Reconcile the registry with disk before answering (restart / crash recovery). */
@@ -90,34 +120,37 @@ export class Branchspace {
       throw new BranchspaceError(`invalid branch name ${JSON.stringify(input.branch)}: ${invalid}`, 'INVALID_BRANCH')
     }
     const root = await resolveMainRepoRoot(input.repoPath)
-    if (input.baseBranch) {
-      const invalidBase = validateBranchName(input.baseBranch)
-      if (invalidBase) {
-        throw new BranchspaceError(`invalid base branch ${JSON.stringify(input.baseBranch)}: ${invalidBase}`, 'INVALID_BRANCH')
+    return this.mutex.run(this.lockKey(root, input.branch), async () => {
+      if (input.baseBranch) {
+        const invalidBase = validateBranchName(input.baseBranch)
+        if (invalidBase) {
+          throw new BranchspaceError(`invalid base branch ${JSON.stringify(input.baseBranch)}: ${invalidBase}`, 'INVALID_BRANCH')
+        }
+        if (!(await branchExists(root, input.baseBranch))) {
+          throw new BranchspaceError(`base branch does not exist: ${input.baseBranch}`, 'NO_BASE')
+        }
       }
-      if (!(await branchExists(root, input.baseBranch))) {
-        throw new BranchspaceError(`base branch does not exist: ${input.baseBranch}`, 'NO_BASE')
-      }
-    }
-    await ensureBranchspaceExcluded(root)
-    const worktreePath = await addWorktree(root, input.branch, input.baseBranch)
+      await ensureBranchspaceExcluded(root)
+      const worktreePath = await addWorktree(root, input.branch, input.baseBranch)
 
-    const title = `${this.repoName(root)} ⎇ ${input.branch}`
-    const existing = await this.deps.registry.get(root, input.branch)
-    const workspaceId =
-      existing?.workspaceId ??
-      (await this.deps.sessions.ensureWorkspace({ path: worktreePath, title }))
-    const sessionId = await this.deps.sessions.createSession({ workspaceId, cwd: worktreePath, title })
+      const title = `${this.repoName(root)} ⎇ ${input.branch}`
+      // idempotent reuse: canonical-path-keyed registry record wins
+      const existing = await this.deps.registry.get(root, input.branch)
+      const workspaceId =
+        existing?.workspaceId ??
+        (await this.deps.sessions.ensureWorkspace({ path: worktreePath, title }))
+      const sessionId = await this.deps.sessions.createSession({ workspaceId, cwd: worktreePath, title })
 
-    await this.deps.registry.upsert(root, {
-      branch: input.branch,
-      worktreePath,
-      workspaceId,
-      sessionIds: existing?.sessionIds ?? [],
-      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      await this.deps.registry.upsert(root, {
+        branch: input.branch,
+        worktreePath,
+        workspaceId,
+        sessionIds: existing?.sessionIds ?? [],
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
+      })
+      await this.deps.registry.attachSession(root, input.branch, sessionId)
+      return { sessionId, workspaceId, worktreePath, branch: input.branch }
     })
-    await this.deps.registry.attachSession(root, input.branch, sessionId)
-    return { sessionId, workspaceId, worktreePath, branch: input.branch }
   }
 
   async list(input: ListInput): Promise<BranchView[]> {
@@ -139,34 +172,46 @@ export class Branchspace {
 
   async finish(input: FinishInput): Promise<FinishResult> {
     const root = await resolveMainRepoRoot(input.repoPath)
-    const rec = await this.deps.registry.get(root, input.branch)
-    const worktreePath = rec?.worktreePath ?? worktreePathFor(root, input.branch)
+    return this.mutex.run(this.lockKey(root, input.branch), async () => {
+      const rec = await this.deps.registry.get(root, input.branch)
+      const worktreePath = rec?.worktreePath ?? worktreePathFor(root, input.branch)
 
-    if (!input.force && (await isWorktreeDirty(worktreePath).catch(() => false))) {
-      throw new BranchspaceError(
-        `worktree for branch "${input.branch}" is dirty; commit/stash changes or pass force`,
-        'DIRTY_WORKTREE',
-      )
-    }
-    await removeWorktree(root, worktreePath, Boolean(input.force))
-    let deletedBranch = false
-    if (input.deleteBranch) {
-      await deleteBranch(root, input.branch)
-      deletedBranch = true
-    }
-    const removed = await this.deps.registry.remove(root, input.branch)
-    if (removed?.workspaceId && this.deps.sessions.removeWorkspace) {
-      await this.deps.sessions.removeWorkspace(removed.workspaceId).catch(() => {})
-    }
-    return {
-      branch: input.branch,
-      worktreePath,
-      removedWorkspaceId: removed?.workspaceId,
-      deletedBranch,
-    }
+      // active-session protection: never strand a live session's cwd by default
+      const live = rec?.workspaceId ? await this.deps.sessions.liveSessionIds(rec.workspaceId) : []
+      if (live.length > 0 && !input.force) {
+        throw new BranchspaceError(
+          `branch "${input.branch}" still has ${live.length} live session(s) attached (${live.join(', ')}); ` +
+            `close them first or pass force`,
+          'LIVE_SESSIONS',
+        )
+      }
+      if (!input.force && (await isWorktreeDirty(worktreePath).catch(() => false))) {
+        throw new BranchspaceError(
+          `worktree for branch "${input.branch}" is dirty; commit/stash changes or pass force`,
+          'DIRTY_WORKTREE',
+        )
+      }
+      await removeWorktree(root, worktreePath, Boolean(input.force))
+      let deletedBranch = false
+      if (input.deleteBranch) {
+        await deleteBranch(root, input.branch)
+        deletedBranch = true
+      }
+      const removed = await this.deps.registry.remove(root, input.branch)
+      if (removed?.workspaceId && this.deps.sessions.removeWorkspace) {
+        await this.deps.sessions.removeWorkspace(removed.workspaceId).catch(() => {})
+      }
+      return {
+        branch: input.branch,
+        worktreePath,
+        removedWorkspaceId: removed?.workspaceId,
+        orphanedSessionIds: input.force ? live : [],
+        deletedBranch,
+      }
+    })
   }
 
-  /** Worktree path where a repo's branch sessions live (used by UI hints). */
+  /** Default base branch of a repo (used by UI hints). */
   async defaultBase(repoPath: string): Promise<string> {
     return defaultBranch(await resolveMainRepoRoot(repoPath))
   }

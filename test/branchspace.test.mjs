@@ -33,6 +33,9 @@ function fakeSessionFactory() {
     async removeWorkspace(workspaceId) {
       workspaces.delete(workspaceId)
     },
+    async liveSessionIds(workspaceId) {
+      return [...(workspaces.get(workspaceId)?.sessionIds ?? [])]
+    },
   }
 }
 
@@ -102,6 +105,7 @@ test('list is empty for a repo without branchspace branches', async (t) => {
 test('finish refuses a dirty worktree without force', async (t) => {
   const { bs, repo, sessions } = await setup(t)
   const started = await bs.start({ repoPath: repo, branch: 'feature-a' })
+  sessions.workspaces.get(started.workspaceId).sessionIds.length = 0 // sessions closed
   await writeRepoFile(started.worktreePath, 'dirty.txt', 'x')
   await assert.rejects(() => bs.finish({ repoPath: repo, branch: 'feature-a' }), /dirty/i)
 })
@@ -109,6 +113,7 @@ test('finish refuses a dirty worktree without force', async (t) => {
 test('finish removes worktree + registry record + workspace, keeps branch by default', async (t) => {
   const { bs, repo, sessions } = await setup(t)
   const started = await bs.start({ repoPath: repo, branch: 'feature-a' })
+  sessions.workspaces.get(started.workspaceId).sessionIds.length = 0 // sessions closed
   await bs.finish({ repoPath: repo, branch: 'feature-a' })
   await assert.rejects(() => stat(started.worktreePath))
   assert.deepEqual(await bs.list({ repoPath: repo }), [])
@@ -120,7 +125,8 @@ test('finish removes worktree + registry record + workspace, keeps branch by def
 
 test('finish with deleteBranch removes the branch too', async (t) => {
   const { bs, repo, sessions } = await setup(t)
-  await bs.start({ repoPath: repo, branch: 'feature-a' })
+  const started = await bs.start({ repoPath: repo, branch: 'feature-a' })
+  sessions.workspaces.get(started.workspaceId).sessionIds.length = 0 // sessions closed
   await bs.finish({ repoPath: repo, branch: 'feature-a', deleteBranch: true })
   const { branchExists } = await import('../lib/git.js')
   assert.equal(await branchExists(repo, 'feature-a'), false)
@@ -158,4 +164,110 @@ test('registry survives a simulated restart and reconciles with disk', async (t)
   const { removeWorktree } = await import('../lib/git.js')
   await removeWorktree(repo, started.worktreePath, true)
   assert.deepEqual(await bs2.list({ repoPath: repo }), [])
+})
+
+test('five concurrent starts of the same branch share one worktree and one workspace', async (t) => {
+  const { bs, repo, sessions } = await setup(t)
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () => bs.start({ repoPath: repo, branch: 'feature-a' })),
+  )
+  const workspaceIds = new Set(results.map((r) => r.workspaceId))
+  const worktreePaths = new Set(results.map((r) => r.worktreePath))
+  assert.equal(workspaceIds.size, 1)
+  assert.equal(worktreePaths.size, 1)
+  assert.equal(sessions.workspaces.size, 1)
+  const { listWorktrees, branchExists, resolveMainRepoRoot } = await import('../lib/git.js')
+  assert.equal((await listWorktrees(repo)).filter((w) => w.branch === 'feature-a').length, 1)
+  assert.ok(await branchExists(repo, 'feature-a'))
+  // every caller still got its own session
+  assert.equal(new Set(results.map((r) => r.sessionId)).size, 5)
+  const root = await resolveMainRepoRoot(repo)
+  const [rec] = await bs.list({ repoPath: root })
+  assert.equal(rec.sessionCount, 5)
+})
+
+test('concurrent starts of different branches do not interfere', async (t) => {
+  const { bs, repo } = await setup(t)
+  const [a, b] = await Promise.all([
+    bs.start({ repoPath: repo, branch: 'feature-a' }),
+    bs.start({ repoPath: repo, branch: 'feature-b' }),
+  ])
+  assert.notEqual(a.workspaceId, b.workspaceId)
+  assert.notEqual(a.worktreePath, b.worktreePath)
+  assert.equal((await bs.list({ repoPath: repo })).length, 2)
+})
+
+test('finish refuses while live sessions are attached to the workspace', async (t) => {
+  const { bs, repo, sessions } = await setup(t)
+  const started = await bs.start({ repoPath: repo, branch: 'feature-a' })
+  await bs.start({ repoPath: repo, branch: 'feature-a' }) // second session on the same branch
+  const err = await bs.finish({ repoPath: repo, branch: 'feature-a' }).then(
+    () => null,
+    (e) => e,
+  )
+  assert.ok(err, 'finish must be rejected')
+  assert.match(err.message, /2 live session/i)
+  assert.match(err.message, /force/i)
+  assert.match(err.message, new RegExp(started.sessionId))
+  // worktree and workspace untouched
+  assert.ok((await stat(started.worktreePath)).isDirectory())
+  assert.equal(sessions.workspaces.size, 1)
+})
+
+test('forced finish detaches live sessions and reports them as orphaned', async (t) => {
+  const { bs, repo, sessions } = await setup(t)
+  const first = await bs.start({ repoPath: repo, branch: 'feature-a' })
+  const second = await bs.start({ repoPath: repo, branch: 'feature-a' })
+  const result = await bs.finish({ repoPath: repo, branch: 'feature-a', force: true })
+  assert.deepEqual(new Set(result.orphanedSessionIds), new Set([first.sessionId, second.sessionId]))
+  assert.equal(sessions.workspaces.size, 0)
+  await assert.rejects(() => stat(first.worktreePath))
+})
+
+test('finish without force succeeds once no live sessions remain', async (t) => {
+  const { bs, repo, sessions } = await setup(t)
+  const started = await bs.start({ repoPath: repo, branch: 'feature-a' })
+  // simulate all sessions closed: detach them from the fake workspace
+  sessions.workspaces.get(started.workspaceId).sessionIds.length = 0
+  const result = await bs.finish({ repoPath: repo, branch: 'feature-a' })
+  assert.deepEqual(result.orphanedSessionIds, [])
+})
+
+test('start and finish of the same branch never run concurrently', async (t) => {
+  const { bs, repo } = await setup(t)
+  await bs.start({ repoPath: repo, branch: 'feature-a' })
+  const [finishResult, startResult] = await Promise.all([
+    bs.finish({ repoPath: repo, branch: 'feature-a', force: true }),
+    bs.start({ repoPath: repo, branch: 'feature-a' }),
+  ])
+  // serialized: whichever ran first, the final state is consistent —
+  // finish-then-start (worktree exists again) or start-then-finish (gone)
+  const exists = await stat(startResult.worktreePath).then(() => true, () => false)
+  const rows = await bs.list({ repoPath: repo })
+  if (exists) {
+    assert.equal(rows.length, 1)
+  } else {
+    assert.equal(finishResult.branch, 'feature-a')
+    assert.equal(rows.length, 0)
+  }
+})
+
+test('symlinked repo path: start returns and persists canonical paths only', async (t) => {
+  const { symlink, realpath: rp } = await import('node:fs/promises')
+  const { bs, repo, sessions } = await setup(t)
+  const linkBase = await rp(await mkdtemp(join(tmpdir(), 'branchspace-symlink-')))
+  t.after(() => rm(linkBase, { recursive: true, force: true }))
+  const link = join(linkBase, 'repo-link')
+  await symlink(repo, link)
+
+  const result = await bs.start({ repoPath: link, branch: 'feature-a' })
+  assert.equal(result.worktreePath, await rp(result.worktreePath), 'returned path is canonical')
+  assert.ok(!result.worktreePath.startsWith(link), 'no symlink prefix anywhere')
+  const { resolveMainRepoRoot } = await import('../lib/git.js')
+  const root = await resolveMainRepoRoot(link)
+  const [rec] = await bs['deps'].registry.list(root)
+  assert.equal(rec.worktreePath, result.worktreePath, 'registry persists canonical path')
+  // session cwd matches the workspace path exactly (attach validation would pass)
+  const sess = [...sessions.sessions.values()].find((s) => s.workspaceId === result.workspaceId)
+  assert.equal(sess.cwd, sessions.workspaces.get(result.workspaceId).path)
 })
